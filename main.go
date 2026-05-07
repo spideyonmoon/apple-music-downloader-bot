@@ -41,47 +41,49 @@ import (
 )
 
 var (
-	forbiddenNames = regexp.MustCompile(`[/\\<>:"|?*]`)
-	dl_atmos       bool
-	dl_aac         bool
-	dl_select      bool
-	dl_song        bool
-	artist_select  bool
-	debug_mode     bool
-	alac_max       *int
-	atmos_max      *int
-	mv_max         *int
-	mv_audio_type  *string
-	aac_type       *string
-	Config         structs.ConfigSet
-	counter        structs.Counter
-	okDict         = make(map[string][]int)
-	lastDownloadedPaths []string
-	activeProgress func(phase string, done, total int64)
-	downloadedMetaMu sync.Mutex
-	downloadedMeta   = make(map[string]AudioMeta)
-	searchMetaMu     sync.Mutex
-	searchMetaByID   = make(map[string]AudioMeta)
+	forbiddenNames       = regexp.MustCompile(`[/\\<>:"|?*]`)
+	dl_atmos             bool
+	dl_aac               bool
+	dl_select            bool
+	dl_song              bool
+	artist_select        bool
+	debug_mode           bool
+	alac_max             *int
+	atmos_max            *int
+	mv_max               *int
+	mv_audio_type        *string
+	aac_type             *string
+	Config               structs.ConfigSet
+	counter              structs.Counter
+	okDict               = make(map[string][]int)
+	lastDownloadedPaths  []string
+	activeProgress       func(phase string, done, total int64)
+	downloadedMetaMu     sync.Mutex
+	downloadedMeta       = make(map[string]AudioMeta)
+	searchMetaMu         sync.Mutex
+	searchMetaByID       = make(map[string]AudioMeta)
+	downloadFailureMu    sync.Mutex
+	lastDownloadFailures []string
 )
 
 type AudioMeta struct {
-	TrackID   string
-	Title     string
-	Performer string
+	TrackID        string
+	Title          string
+	Performer      string
 	DurationMillis int64
 }
 
 type CachedAudio struct {
-	FileID    string    `json:"file_id"`
-	FileSize  int64     `json:"file_size"`
-	Compressed bool     `json:"compressed"`
-	Format    string    `json:"format,omitempty"`
-	SizeBytes  int64    `json:"size_bytes,omitempty"`
-	BitrateKbps float64 `json:"bitrate_kbps,omitempty"`
-	DurationMillis int64 `json:"duration_millis,omitempty"`
-	Title     string    `json:"title,omitempty"`
-	Performer string    `json:"performer,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	FileID         string    `json:"file_id"`
+	FileSize       int64     `json:"file_size"`
+	Compressed     bool      `json:"compressed"`
+	Format         string    `json:"format,omitempty"`
+	SizeBytes      int64     `json:"size_bytes,omitempty"`
+	BitrateKbps    float64   `json:"bitrate_kbps,omitempty"`
+	DurationMillis int64     `json:"duration_millis,omitempty"`
+	Title          string    `json:"title,omitempty"`
+	Performer      string    `json:"performer,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
 type CachedDocument struct {
@@ -91,8 +93,8 @@ type CachedDocument struct {
 }
 
 type telegramCacheFile struct {
-	Version int                    `json:"version"`
-	Items   map[string]CachedAudio `json:"items"`
+	Version   int                       `json:"version"`
+	Items     map[string]CachedAudio    `json:"items"`
 	Documents map[string]CachedDocument `json:"documents,omitempty"`
 }
 
@@ -117,9 +119,9 @@ func recordDownloadedTrack(track *task.Track) {
 	}
 	lastDownloadedPaths = append(lastDownloadedPaths, track.SavePath)
 	meta := AudioMeta{
-		TrackID:   strings.TrimSpace(track.ID),
-		Title:     strings.TrimSpace(track.Resp.Attributes.Name),
-		Performer: strings.TrimSpace(track.Resp.Attributes.ArtistName),
+		TrackID:        strings.TrimSpace(track.ID),
+		Title:          strings.TrimSpace(track.Resp.Attributes.Name),
+		Performer:      strings.TrimSpace(track.Resp.Attributes.ArtistName),
 		DurationMillis: int64(track.Resp.Attributes.DurationInMillis),
 	}
 	if meta.TrackID != "" {
@@ -151,8 +153,45 @@ func clearDownloadState() {
 	downloadedMetaMu.Lock()
 	downloadedMeta = make(map[string]AudioMeta)
 	downloadedMetaMu.Unlock()
-	defer clearDownloadState()
 	debug.FreeOSMemory()
+}
+
+func resetDownloadFailures() {
+	downloadFailureMu.Lock()
+	lastDownloadFailures = nil
+	downloadFailureMu.Unlock()
+}
+
+func recordDownloadFailure(format string, args ...any) {
+	msg := strings.TrimSpace(fmt.Sprintf(format, args...))
+	if msg == "" {
+		return
+	}
+	downloadFailureMu.Lock()
+	defer downloadFailureMu.Unlock()
+	for _, existing := range lastDownloadFailures {
+		if existing == msg {
+			return
+		}
+	}
+	lastDownloadFailures = append(lastDownloadFailures, msg)
+}
+
+func downloadFailureSummary() string {
+	downloadFailureMu.Lock()
+	defer downloadFailureMu.Unlock()
+	if len(lastDownloadFailures) == 0 {
+		return ""
+	}
+	limit := len(lastDownloadFailures)
+	if limit > 3 {
+		limit = 3
+	}
+	summary := strings.Join(lastDownloadFailures[:limit], "; ")
+	if len(lastDownloadFailures) > limit {
+		summary += fmt.Sprintf("; and %d more", len(lastDownloadFailures)-limit)
+	}
+	return summary
 }
 
 func setSearchMeta(trackID string, title string, performer string) {
@@ -583,7 +622,6 @@ func convertIfNeeded(track *task.Track, lrc string) {
 	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, activeProgress)
 }
 
-
 func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	var err error
 	counter.Total++
@@ -623,6 +661,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	if track.WebM3u8 == "" && !needDlAacLc {
 		if dl_atmos {
 			fmt.Println("Unavailable")
+			recordDownloadFailure("%s: Dolby Atmos is unavailable", track.Name)
 			counter.Unavailable++
 			return
 		}
@@ -654,6 +693,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			_, Quality, err = extractMedia(track.M3u8, true)
 			if err != nil {
 				fmt.Println("Failed to extract quality from manifest.\n", err)
+				recordDownloadFailure("%s: failed to read quality from manifest: %v", track.Name, err)
 				counter.Error++
 				return
 			}
@@ -770,12 +810,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	if needDlAacLc {
 		if len(mediaUserToken) <= 50 {
 			fmt.Println("Invalid media-user-token")
+			recordDownloadFailure("%s: AAC-LC fallback requires a valid media-user-token", track.Name)
 			counter.Error++
 			return
 		}
 		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "", activeProgress)
 		if err != nil {
 			fmt.Println("Failed to dl aac-lc:", err)
+			recordDownloadFailure("%s: failed to download AAC-LC: %v", track.Name, err)
 			if err.Error() == "Unavailable" {
 				counter.Unavailable++
 				return
@@ -787,6 +829,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to extract info from manifest:", err)
+			recordDownloadFailure("%s: failed to extract stream URL: %v", track.Name, err)
 			counter.Unavailable++
 			return
 		}
@@ -794,6 +837,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config, activeProgress)
 		if err != nil {
 			fmt.Println("Failed to run v2:", err)
+			recordDownloadFailure("%s: failed to decrypt/download ALAC: %v", track.Name, err)
 			counter.Error++
 			return
 		}
@@ -816,6 +860,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("Embed failed: %v\n", err)
+		recordDownloadFailure("%s: MP4Box tagging failed: %v", track.Name, err)
 		counter.Error++
 		return
 	}
@@ -830,6 +875,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	err = writeMP4Tags(track, lrc)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to write tags in media:", err)
+		recordDownloadFailure("%s: failed to write MP4 tags: %v", track.Name, err)
 		counter.Unavailable++
 		return
 	}
@@ -1193,7 +1239,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	os.MkdirAll(albumFolderPath, os.ModePerm)
 	album.SaveName = albumFolderName
 	fmt.Println(albumFolderName)
-	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0{
+	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0 {
 		if meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url != "" {
 			_, err = writeCover(singerFolder, "folder", meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url)
 			if err != nil {
@@ -1277,6 +1323,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 					return nil
 				}
 			}
+			return ripAlbumSongFallback(album, urlArg_i, token, storefront, mediaUserToken, albumFolderPath, covPath, Codec)
 		}
 		return nil
 	}
@@ -2356,8 +2403,14 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 		fmt.Println("Failed to get song response.")
 		return err
 	}
+	if manifest == nil || len(manifest.Data) == 0 {
+		return fmt.Errorf("empty song response for %s", songId)
+	}
 
 	songData := manifest.Data[0]
+	if len(songData.Relationships.Albums.Data) == 0 {
+		return fmt.Errorf("song %s has no album relationship", songId)
+	}
 	albumId := songData.Relationships.Albums.Data[0].ID
 
 	// Use album approach but only download the specific song
@@ -2371,19 +2424,127 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 	return nil
 }
 
+func songRespDataToTrackRespData(song ampapi.SongRespData) (ampapi.TrackRespData, error) {
+	var track ampapi.TrackRespData
+	data, err := json.Marshal(song)
+	if err != nil {
+		return track, err
+	}
+	if err := json.Unmarshal(data, &track); err != nil {
+		return track, err
+	}
+	if track.ID == "" {
+		track.ID = song.ID
+	}
+	if track.Type == "" {
+		track.Type = "songs"
+	}
+	return track, nil
+}
 
+func songBelongsToAlbum(song ampapi.SongRespData, albumID string) bool {
+	if albumID == "" || len(song.Relationships.Albums.Data) == 0 {
+		return true
+	}
+	for _, album := range song.Relationships.Albums.Data {
+		if album.ID == albumID {
+			return true
+		}
+	}
+	return false
+}
+
+func buildAlbumTrackFromSongData(song ampapi.SongRespData, album *task.Album, albumFolderPath string, coverPath string, codec string) (*task.Track, error) {
+	if album == nil || len(album.Resp.Data) == 0 {
+		return nil, errors.New("album metadata is empty")
+	}
+	if song.ID == "" {
+		return nil, errors.New("song id is empty")
+	}
+	if !songBelongsToAlbum(song, album.ID) {
+		return nil, fmt.Errorf("song %s does not belong to album %s", song.ID, album.ID)
+	}
+	trackResp, err := songRespDataToTrackRespData(song)
+	if err != nil {
+		return nil, err
+	}
+	discTotal := song.Attributes.DiscNumber
+	for _, track := range album.Resp.Data[0].Relationships.Tracks.Data {
+		if track.Attributes.DiscNumber > discTotal {
+			discTotal = track.Attributes.DiscNumber
+		}
+	}
+	if discTotal <= 0 {
+		discTotal = 1
+	}
+	taskNum := song.Attributes.TrackNumber
+	if taskNum <= 0 {
+		taskNum = 1
+	}
+	taskTotal := album.Resp.Data[0].Attributes.TrackCount
+	if taskTotal <= 0 {
+		taskTotal = len(album.Resp.Data[0].Relationships.Tracks.Data)
+	}
+	if taskTotal <= 0 {
+		taskTotal = 1
+	}
+	trackType := song.Type
+	if trackType == "" {
+		trackType = "songs"
+	}
+	return &task.Track{
+		ID:         song.ID,
+		Type:       trackType,
+		Name:       song.Attributes.Name,
+		Language:   album.Language,
+		Storefront: album.Storefront,
+		SaveDir:    albumFolderPath,
+		Codec:      codec,
+		TaskNum:    taskNum,
+		TaskTotal:  taskTotal,
+		M3u8:       song.Attributes.ExtendedAssetUrls.EnhancedHls,
+		WebM3u8:    song.Attributes.ExtendedAssetUrls.EnhancedHls,
+		CoverPath:  coverPath,
+		Resp:       trackResp,
+		PreType:    "albums",
+		PreID:      album.ID,
+		DiscTotal:  discTotal,
+		AlbumData:  album.Resp.Data[0],
+	}, nil
+}
+
+func ripAlbumSongFallback(album *task.Album, songID string, token string, storefront string, mediaUserToken string, albumFolderPath string, coverPath string, codec string) error {
+	manifest, err := ampapi.GetSongResp(storefront, songID, album.Language, token)
+	if err != nil {
+		recordDownloadFailure("song %s: failed to fetch direct song metadata: %v", songID, err)
+		return err
+	}
+	if manifest == nil || len(manifest.Data) == 0 {
+		err := fmt.Errorf("empty song response for %s", songID)
+		recordDownloadFailure("song %s: %v", songID, err)
+		return err
+	}
+	track, err := buildAlbumTrackFromSongData(manifest.Data[0], album, albumFolderPath, coverPath, codec)
+	if err != nil {
+		recordDownloadFailure("song %s: failed to build direct download metadata: %v", songID, err)
+		return err
+	}
+	fmt.Println("Song was not found in album track list, downloading by song metadata.")
+	ripTrack(track, token, mediaUserToken)
+	return nil
+}
 
 const (
-	defaultSearchLimit = 8
-	defaultQueueSize  = 20
-	pendingTTL         = 10 * time.Minute
-	defaultTelegramFormat = "alac"
+	defaultSearchLimit           = 8
+	defaultQueueSize             = 20
+	pendingTTL                   = 10 * time.Minute
+	defaultTelegramFormat        = "alac"
 	defaultTelegramDownloadMaxGB = 3
 )
 
 const (
-	telegramFormatAlac = "alac"
-	telegramFormatFlac = "flac"
+	telegramFormatAlac   = "alac"
+	telegramFormatFlac   = "flac"
 	transferModeOneByOne = "one"
 	transferModeZip      = "zip"
 )
@@ -2436,13 +2597,13 @@ type PendingAlbumTransfer struct {
 }
 
 type downloadRequest struct {
-	chatID    int64
-	replyToID int
-	single    bool
-	format    string
+	chatID       int64
+	replyToID    int
+	single       bool
+	format       string
 	transferMode string
-	albumID   string
-	fn        func() error
+	albumID      string
+	fn           func() error
 }
 
 type Update struct {
@@ -2487,11 +2648,11 @@ type InlineKeyboardMarkup struct {
 }
 
 type InlineKeyboardButton struct {
-	Text                        string `json:"text"`
-	CallbackData                string `json:"callback_data,omitempty"`
-	SwitchInlineQuery           *string `json:"switch_inline_query,omitempty"`
+	Text                         string  `json:"text"`
+	CallbackData                 string  `json:"callback_data,omitempty"`
+	SwitchInlineQuery            *string `json:"switch_inline_query,omitempty"`
 	SwitchInlineQueryCurrentChat *string `json:"switch_inline_query_current_chat,omitempty"`
-	Url                         string `json:"url,omitempty"`
+	Url                          string  `json:"url,omitempty"`
 }
 
 type ReplyKeyboardMarkup struct {
@@ -2526,9 +2687,9 @@ type sendMessageResponse struct {
 }
 
 type sendAudioResponse struct {
-	OK          bool   `json:"ok"`
+	OK          bool         `json:"ok"`
 	Result      AudioMessage `json:"result"`
-	Description string `json:"description,omitempty"`
+	Description string       `json:"description,omitempty"`
 }
 
 type sendDocumentResponse struct {
@@ -2636,20 +2797,20 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	}
 	apiBase := normalizeTelegramAPIBase(Config.TelegramAPIURL)
 	bot := &TelegramBot{
-		token:         token,
-		apiBase:       apiBase,
-		appleToken:    appleToken,
-		client:        &http.Client{Timeout: 60 * time.Second},
-		allowedChats:  allowed,
-		searchLimit:   searchLimit,
-		maxFileBytes:  maxFileBytes,
-		chatFormats:   make(map[int64]string),
-		pending:       make(map[int64]*PendingSelection),
+		token:            token,
+		apiBase:          apiBase,
+		appleToken:       appleToken,
+		client:           &http.Client{Timeout: 60 * time.Second},
+		allowedChats:     allowed,
+		searchLimit:      searchLimit,
+		maxFileBytes:     maxFileBytes,
+		chatFormats:      make(map[int64]string),
+		pending:          make(map[int64]*PendingSelection),
 		pendingTransfers: make(map[int64]*PendingAlbumTransfer),
-		downloadQueue: make(chan *downloadRequest, queueSize),
-		cacheFile:     cacheFile,
-		cache:         make(map[string]CachedAudio),
-		docCache:      make(map[string]CachedDocument),
+		downloadQueue:    make(chan *downloadRequest, queueSize),
+		cacheFile:        cacheFile,
+		cache:            make(map[string]CachedAudio),
+		docCache:         make(map[string]CachedDocument),
 	}
 	bot.loadCache()
 	bot.startDownloadWorker()
@@ -3461,13 +3622,13 @@ func (b *TelegramBot) enqueueDownload(chatID int64, replyToID int, single bool, 
 		transferMode = transferModeOneByOne
 	}
 	req := &downloadRequest{
-		chatID:    chatID,
-		replyToID: replyToID,
-		single:    single,
-		format:    format,
+		chatID:       chatID,
+		replyToID:    replyToID,
+		single:       single,
+		format:       format,
 		transferMode: transferMode,
-		albumID:   albumID,
-		fn:        fn,
+		albumID:      albumID,
+		fn:           fn,
 	}
 	b.queueMu.Lock()
 	inProgress := b.inProgress
@@ -3529,6 +3690,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 	downloadedMetaMu.Lock()
 	downloadedMeta = make(map[string]AudioMeta)
 	downloadedMetaMu.Unlock()
+	resetDownloadFailures()
 	counter = structs.Counter{}
 	okDict = make(map[string][]int)
 
@@ -3593,6 +3755,14 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 
 	paths := append([]string{}, lastDownloadedPaths...)
 	if len(paths) == 0 {
+		if summary := downloadFailureSummary(); summary != "" {
+			status.UpdateSync("No files were downloaded: "+summary, 0, 0)
+			return
+		}
+		if counter.Error > 0 || counter.Unavailable > 0 {
+			status.UpdateSync(fmt.Sprintf("No files were downloaded. Errors: %d, unavailable: %d.", counter.Error, counter.Unavailable), 0, 0)
+			return
+		}
 		status.UpdateSync("No files were downloaded.", 0, 0)
 		return
 	}
@@ -4006,15 +4176,15 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	}
 	if hasMeta && meta.TrackID != "" && apiResp.Result.Audio.FileID != "" {
 		b.storeCachedAudio(meta.TrackID, CachedAudio{
-			FileID:     apiResp.Result.Audio.FileID,
-			FileSize:   apiResp.Result.Audio.FileSize,
-			Compressed: compressed,
-			Format:     format,
-			SizeBytes:  sizeBytes,
-			BitrateKbps: bitrateKbps,
+			FileID:         apiResp.Result.Audio.FileID,
+			FileSize:       apiResp.Result.Audio.FileSize,
+			Compressed:     compressed,
+			Format:         format,
+			SizeBytes:      sizeBytes,
+			BitrateKbps:    bitrateKbps,
 			DurationMillis: durationMillis,
-			Title:      meta.Title,
-			Performer:  meta.Performer,
+			Title:          meta.Title,
+			Performer:      meta.Performer,
 		})
 	}
 	return nil
