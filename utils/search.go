@@ -26,6 +26,7 @@ type SearchResultItem struct {
 	ContentRating string
 	Artist        string
 	Album         string
+	ArtworkURL    string
 }
 
 // SearchSelection represents the chosen search result and user preferences.
@@ -101,6 +102,22 @@ func ratingRank(rating string) int {
 	default:
 		return 2
 	}
+}
+
+// SearchArtworkURL turns Apple Music artwork templates into a Telegram-fetchable URL.
+func SearchArtworkURL(raw string, size int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if size <= 0 {
+		size = 512
+	}
+	replacement := fmt.Sprintf("%dx%d", size, size)
+	raw = strings.ReplaceAll(raw, "{w}x{h}", replacement)
+	raw = strings.ReplaceAll(raw, "{w}", strconv.Itoa(size))
+	raw = strings.ReplaceAll(raw, "{h}", strconv.Itoa(size))
+	return raw
 }
 
 func sortSongVariants(items []SearchResultItem) {
@@ -219,6 +236,7 @@ func HandleSearch(searchType string, queryParts []string, token, storefront, lan
 						ID:            item.ID,
 						ContentRating: item.Attributes.ContentRating,
 						Artist:        item.Attributes.ArtistName,
+						ArtworkURL:    item.Attributes.Artwork.URL,
 					})
 				}
 				hasNext = searchResp.Results.Albums.Next != ""
@@ -236,6 +254,7 @@ func HandleSearch(searchType string, queryParts []string, token, storefront, lan
 						ContentRating: item.Attributes.ContentRating,
 						Artist:        item.Attributes.ArtistName,
 						Album:         item.Attributes.AlbumName,
+						ArtworkURL:    item.Attributes.Artwork.URL,
 					})
 				}
 				sortSongVariants(items)
@@ -249,11 +268,12 @@ func HandleSearch(searchType string, queryParts []string, token, storefront, lan
 						detail = strings.Join(item.Attributes.GenreNames, ", ")
 					}
 					items = append(items, SearchResultItem{
-						Type:   "Artist",
-						Name:   item.Attributes.Name,
-						Detail: detail,
-						URL:    item.Attributes.URL,
-						ID:     item.ID,
+						Type:       "Artist",
+						Name:       item.Attributes.Name,
+						Detail:     detail,
+						URL:        item.Attributes.URL,
+						ID:         item.ID,
+						ArtworkURL: item.Attributes.Artwork.URL,
 					})
 				}
 				hasNext = searchResp.Results.Artists.Next != ""
@@ -346,6 +366,7 @@ func BuildSearchItems(kind string, resp *ampapi.SearchResp) ([]SearchResultItem,
 				ContentRating: item.Attributes.ContentRating,
 				Artist:        item.Attributes.ArtistName,
 				Album:         item.Attributes.AlbumName,
+				ArtworkURL:    item.Attributes.Artwork.URL,
 			})
 		}
 		sortSongVariants(items)
@@ -368,6 +389,7 @@ func BuildSearchItems(kind string, resp *ampapi.SearchResp) ([]SearchResultItem,
 				ID:            item.ID,
 				ContentRating: item.Attributes.ContentRating,
 				Artist:        item.Attributes.ArtistName,
+				ArtworkURL:    item.Attributes.Artwork.URL,
 			})
 		}
 		hasNext = resp.Results.Albums.Next != ""
@@ -378,11 +400,12 @@ func BuildSearchItems(kind string, resp *ampapi.SearchResp) ([]SearchResultItem,
 		for _, item := range resp.Results.Artists.Data {
 			detail := strings.Join(item.Attributes.GenreNames, ", ")
 			items = append(items, SearchResultItem{
-				Type:   "Artist",
-				Name:   item.Attributes.Name,
-				Detail: detail,
-				URL:    item.Attributes.URL,
-				ID:     item.ID,
+				Type:       "Artist",
+				Name:       item.Attributes.Name,
+				Detail:     detail,
+				URL:        item.Attributes.URL,
+				ID:         item.ID,
+				ArtworkURL: item.Attributes.Artwork.URL,
 			})
 		}
 		hasNext = resp.Results.Artists.Next != ""
@@ -452,6 +475,7 @@ func FetchArtistAlbums(storefront, artistID, token string, limit int, pageOffset
 				ID:            album.ID,
 				ContentRating: album.Attributes.ContentRating,
 				Artist:        album.Attributes.ArtistName,
+				ArtworkURL:    album.Attributes.Artwork.URL,
 			})
 		}
 		if obj.Next == "" {

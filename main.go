@@ -2733,6 +2733,7 @@ type InlineQueryResultArticle struct {
 	ID                  string              `json:"id"`
 	Title               string              `json:"title"`
 	Description         string              `json:"description,omitempty"`
+	ThumbnailURL        string              `json:"thumbnail_url,omitempty"`
 	InputMessageContent InputMessageContent `json:"input_message_content"`
 }
 
@@ -3275,6 +3276,10 @@ func (b *TelegramBot) handleInlineQuery(q *InlineQuery) {
 		_ = b.answerInlineQuery(q.ID, []any{}, true)
 		return
 	}
+	if kind, term, ok := parseInlineSearchQuery(query); ok {
+		b.answerInlineSearch(q.ID, kind, term)
+		return
+	}
 	trackID := extractInlineTrackID(query)
 	if trackID == "" {
 		_ = b.answerInlineQuery(q.ID, []any{}, true)
@@ -3320,16 +3325,44 @@ func (b *TelegramBot) handleInlineQuery(q *InlineQuery) {
 	_ = b.answerInlineQuery(q.ID, results, true)
 }
 
+func (b *TelegramBot) answerInlineSearch(inlineQueryID string, kind string, term string) {
+	items, _, err := b.fetchSearchPage(kind, term, 0)
+	if err != nil || len(items) == 0 {
+		_ = b.answerInlineQuery(inlineQueryID, []any{}, true)
+		return
+	}
+	results := make([]any, 0, len(items))
+	for i, item := range items {
+		messageText := inlineSearchMessageText(kind, item)
+		if messageText == "" {
+			continue
+		}
+		results = append(results, InlineQueryResultArticle{
+			Type:         "article",
+			ID:           fmt.Sprintf("search_%s_%s_%d", kind, item.ID, i),
+			Title:        inlineSearchTitle(item),
+			Description:  item.Detail,
+			ThumbnailURL: apputils.SearchArtworkURL(item.ArtworkURL, 160),
+			InputMessageContent: InputMessageContent{
+				MessageText: messageText,
+			},
+		})
+	}
+	_ = b.answerInlineQuery(inlineQueryID, results, true)
+}
+
 func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, replyToID int) {
 	switch cmd {
 	case "start", "help":
 		_ = b.sendMessage(chatID, botHelpText(), nil)
 	case "search_song":
 		b.handleSearch(chatID, "song", strings.Join(args, " "), replyToID)
-	case "search_album":
+	case "search_album", "serach_album":
 		b.handleSearch(chatID, "album", strings.Join(args, " "), replyToID)
-	case "search_artist":
+	case "search_artist", "serach_artist":
 		b.handleSearch(chatID, "artist", strings.Join(args, " "), replyToID)
+	case "serach_song":
+		b.handleSearch(chatID, "song", strings.Join(args, " "), replyToID)
 	case "search":
 		if len(args) < 2 {
 			_ = b.sendMessageWithReply(chatID, "Usage: /search <song|album|artist> <keywords>", nil, replyToID)
@@ -3366,6 +3399,12 @@ func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, rep
 			return
 		}
 		b.queueDownloadAlbum(chatID, args[0])
+	case "artistid":
+		if len(args) == 0 {
+			_ = b.sendMessage(chatID, "Usage: /artistid <id> [name]", nil)
+			return
+		}
+		b.showArtistAlbums(chatID, args[0], strings.Join(args[1:], " "), replyToID)
 	case "settings":
 		if len(args) > 0 {
 			normalized := normalizeTelegramFormat(args[0])
@@ -3458,24 +3497,32 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 	case "album", "artist_album":
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
-		albums, hasNext, err := apputils.FetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, 0, b.searchLanguage())
-		if err != nil {
-			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
-			return
-		}
-		if len(albums) == 0 {
-			_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
-			return
-		}
-		message := apputils.FormatArtistAlbums(selected.Name, albums)
-		messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(albums), false, hasNext), replyToID)
-		if err != nil {
-			return
-		}
-		b.setPending(chatID, "artist_album", selected.ID, 0, albums, hasNext, replyToID, messageID, selected.Name)
+		b.showArtistAlbums(chatID, selected.ID, selected.Name, replyToID)
 	default:
 		b.clearPending(chatID)
 	}
+}
+
+func (b *TelegramBot) showArtistAlbums(chatID int64, artistID string, artistName string, replyToID int) {
+	artistName = strings.TrimSpace(artistName)
+	if artistName == "" {
+		artistName = artistID
+	}
+	albums, hasNext, err := apputils.FetchArtistAlbums(Config.Storefront, artistID, b.appleToken, b.searchLimit, 0, b.searchLanguage())
+	if err != nil {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
+		return
+	}
+	if len(albums) == 0 {
+		_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
+		return
+	}
+	message := apputils.FormatArtistAlbums(artistName, albums)
+	messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(albums), false, hasNext), replyToID)
+	if err != nil {
+		return
+	}
+	b.setPending(chatID, "artist_album", artistID, 0, albums, hasNext, replyToID, messageID, artistName)
 }
 
 func (b *TelegramBot) handleAlbumTransfer(chatID int64, messageID int, mode string) {
@@ -5078,6 +5125,61 @@ func parseCommand(text string) (string, []string, bool) {
 	return strings.ToLower(cmd), parts[1:], true
 }
 
+func parseInlineSearchQuery(query string) (string, string, bool) {
+	fields := strings.Fields(strings.TrimSpace(query))
+	if len(fields) < 2 {
+		return "", "", false
+	}
+	cmd := strings.TrimPrefix(strings.ToLower(fields[0]), "/")
+	switch cmd {
+	case "search_song", "serach_song":
+		return "song", strings.Join(fields[1:], " "), true
+	case "search_album", "serach_album":
+		return "album", strings.Join(fields[1:], " "), true
+	case "search_artist", "serach_artist":
+		return "artist", strings.Join(fields[1:], " "), true
+	default:
+		return "", "", false
+	}
+}
+
+func inlineSearchTitle(item apputils.SearchResultItem) string {
+	title := strings.TrimSpace(item.Name)
+	switch strings.ToLower(item.ContentRating) {
+	case "explicit":
+		title = "[E] " + title
+	case "clean":
+		title = "[C] " + title
+	}
+	return title
+}
+
+func inlineSearchMessageText(kind string, item apputils.SearchResultItem) string {
+	switch kind {
+	case "song":
+		if item.ID == "" {
+			return ""
+		}
+		return "/songid " + item.ID
+	case "album":
+		if item.ID == "" {
+			return ""
+		}
+		return "/albumid " + item.ID
+	case "artist":
+		if item.ID == "" {
+			return ""
+		}
+		text := "/artistid " + item.ID
+		if item.Name != "" {
+			text += " " + item.Name
+		}
+		return text
+	default:
+		return ""
+	}
+}
+
 func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMarkup {
 	rowSize := 4
 	rows := [][]InlineKeyboardButton{}
@@ -5158,7 +5260,13 @@ Commands:
 /search <type> <keywords> unified search (type: song|album|artist)
 /songid <id>              download a song by ID
 /albumid <id>             download an album by ID
+/artistid <id> [name]     list artist albums by ID
 /id <song|album> <id>     download by ID
 /settings [alac|flac]     set download format (default: alac)
+
+Inline:
+@bot /search_song <keywords>
+@bot /search_album <keywords>
+@bot /search_artist <keywords>
 `)
 }
