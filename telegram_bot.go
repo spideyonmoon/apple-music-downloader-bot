@@ -44,6 +44,7 @@ type TelegramBot struct {
 	appleToken   string
 	client       *http.Client
 	allowedChats map[int64]bool
+	cacheChatID  int64
 	searchLimit  int
 	maxFileBytes int64
 
@@ -93,13 +94,15 @@ type downloadRequest struct {
 	transferMode string
 	albumID      string
 	fn           func() error
+	after        func()
 }
 
 type Update struct {
-	UpdateID      int            `json:"update_id"`
-	Message       *Message       `json:"message,omitempty"`
-	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
-	InlineQuery   *InlineQuery   `json:"inline_query,omitempty"`
+	UpdateID           int                 `json:"update_id"`
+	Message            *Message            `json:"message,omitempty"`
+	CallbackQuery      *CallbackQuery      `json:"callback_query,omitempty"`
+	InlineQuery        *InlineQuery        `json:"inline_query,omitempty"`
+	ChosenInlineResult *ChosenInlineResult `json:"chosen_inline_result,omitempty"`
 }
 
 type Message struct {
@@ -110,16 +113,24 @@ type Message struct {
 }
 
 type CallbackQuery struct {
-	ID      string   `json:"id"`
-	From    *User    `json:"from,omitempty"`
-	Message *Message `json:"message,omitempty"`
-	Data    string   `json:"data,omitempty"`
+	ID              string   `json:"id"`
+	From            *User    `json:"from,omitempty"`
+	Message         *Message `json:"message,omitempty"`
+	InlineMessageID string   `json:"inline_message_id,omitempty"`
+	Data            string   `json:"data,omitempty"`
 }
 
 type InlineQuery struct {
 	ID    string `json:"id"`
 	From  *User  `json:"from,omitempty"`
 	Query string `json:"query"`
+}
+
+type ChosenInlineResult struct {
+	ResultID        string `json:"result_id"`
+	From            *User  `json:"from,omitempty"`
+	Query           string `json:"query,omitempty"`
+	InlineMessageID string `json:"inline_message_id,omitempty"`
 }
 
 type User struct {
@@ -243,16 +254,25 @@ type InlineQueryResultCachedAudio struct {
 }
 
 type InlineQueryResultArticle struct {
-	Type                string              `json:"type"`
-	ID                  string              `json:"id"`
-	Title               string              `json:"title"`
-	Description         string              `json:"description,omitempty"`
-	ThumbnailURL        string              `json:"thumbnail_url,omitempty"`
-	InputMessageContent InputMessageContent `json:"input_message_content"`
+	Type                string                `json:"type"`
+	ID                  string                `json:"id"`
+	Title               string                `json:"title"`
+	Description         string                `json:"description,omitempty"`
+	ThumbnailURL        string                `json:"thumbnail_url,omitempty"`
+	ReplyMarkup         *InlineKeyboardMarkup `json:"reply_markup,omitempty"`
+	InputMessageContent InputMessageContent   `json:"input_message_content"`
 }
 
 type InputMessageContent struct {
 	MessageText string `json:"message_text"`
+}
+
+type InputMediaAudio struct {
+	Type      string `json:"type"`
+	Media     string `json:"media"`
+	Caption   string `json:"caption,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Performer string `json:"performer,omitempty"`
 }
 
 func runTelegramBot(appleToken string) {
@@ -317,6 +337,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		appleToken:       appleToken,
 		client:           &http.Client{Timeout: 60 * time.Second},
 		allowedChats:     allowed,
+		cacheChatID:      Config.TelegramCacheChatID,
 		searchLimit:      searchLimit,
 		maxFileBytes:     maxFileBytes,
 		chatFormats:      make(map[int64]string),
@@ -351,6 +372,8 @@ func (b *TelegramBot) loop() {
 				b.handleCallback(upd.CallbackQuery)
 			} else if upd.InlineQuery != nil {
 				b.handleInlineQuery(upd.InlineQuery)
+			} else if upd.ChosenInlineResult != nil {
+				b.handleChosenInlineResult(upd.ChosenInlineResult)
 			}
 		}
 	}
@@ -364,6 +387,9 @@ func (b *TelegramBot) startDownloadWorker() {
 			b.queueMu.Unlock()
 
 			b.runDownload(req.chatID, req.fn, req.single, req.replyToID, req.format, req.transferMode, req.albumID)
+			if req.after != nil {
+				req.after()
+			}
 
 			b.queueMu.Lock()
 			b.inProgress = false
@@ -801,22 +827,66 @@ func (b *TelegramBot) answerInlineSearch(inlineQueryID string, kind string, term
 	}
 	results := make([]any, 0, len(items))
 	for i, item := range items {
+		if kind == "song" && item.ID == "" {
+			continue
+		}
+		if kind == "song" {
+			if cached, ok := b.inlineCachedAudioResult(item, i); ok {
+				results = append(results, cached)
+				continue
+			}
+		}
 		messageText := inlineSearchMessageText(kind, item)
 		if messageText == "" {
 			continue
 		}
 		results = append(results, InlineQueryResultArticle{
 			Type:         "article",
-			ID:           fmt.Sprintf("search_%s_%s_%d", kind, item.ID, i),
+			ID:           inlineSearchResultID(kind, item.ID, i),
 			Title:        inlineSearchTitle(item),
 			Description:  item.Detail,
 			ThumbnailURL: apputils.SearchArtworkURL(item.ArtworkURL, 160),
+			ReplyMarkup:  inlineSearchReplyMarkup(item),
 			InputMessageContent: InputMessageContent{
-				MessageText: messageText,
+				MessageText: inlinePendingMessageText(kind, item, messageText),
 			},
 		})
 	}
 	_ = b.answerInlineQuery(inlineQueryID, results, true)
+}
+
+func (b *TelegramBot) inlineCachedAudioResult(item apputils.SearchResultItem, index int) (InlineQueryResultCachedAudio, bool) {
+	entry, ok := b.getCachedAudio(item.ID, b.maxFileBytes, "")
+	if !ok {
+		return InlineQueryResultCachedAudio{}, false
+	}
+	entry = b.enrichCachedAudio(item.ID, entry)
+	format := normalizeTelegramFormat(entry.Format)
+	if format == "" {
+		format = telegramFormatAlac
+	}
+	resultID := fmt.Sprintf("cached:%s:%d", item.ID, index)
+	return InlineQueryResultCachedAudio{
+		Type:        "audio",
+		ID:          resultID,
+		AudioFileID: entry.FileID,
+		Caption:     formatTelegramCaption(entry.SizeBytes, entry.BitrateKbps, format),
+	}, true
+}
+
+func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
+	if result == nil || result.From == nil {
+		return
+	}
+	songID := songIDFromInlineResultID(result.ResultID)
+	if songID == "" {
+		return
+	}
+	chatID := result.From.ID
+	if !b.isAllowedChat(chatID) {
+		return
+	}
+	b.queueInlineSongDownload(chatID, songID, result.InlineMessageID)
 }
 
 func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, replyToID int) {
@@ -1094,6 +1164,40 @@ func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, songID string, re
 	})
 }
 
+func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlineMessageID string) {
+	if songID == "" {
+		_ = b.sendMessage(chatID, "Song ID is empty.", nil)
+		return
+	}
+	format := b.getChatFormat(chatID)
+	if inlineMessageID != "" && b.tryEditInlineCachedTrack(inlineMessageID, songID, format) {
+		return
+	}
+	uploadChatID := chatID
+	if inlineMessageID != "" {
+		if b.cacheChatID == 0 {
+			_ = b.editInlineMessageText(inlineMessageID, "Preparing audio failed: telegram-cache-chat-id is not set.")
+			return
+		}
+		uploadChatID = b.cacheChatID
+	}
+	after := func() {
+		if inlineMessageID == "" {
+			return
+		}
+		if b.tryEditInlineCachedTrack(inlineMessageID, songID, format) {
+			return
+		}
+		_ = b.editInlineMessageText(inlineMessageID, "Download failed. Please check bot logs or cache chat permissions.")
+	}
+	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, true, format, transferModeOneByOne, "", func() error {
+		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken)
+	}, after)
+	if !ok && inlineMessageID != "" {
+		_ = b.editInlineMessageText(inlineMessageID, "Download queue is full. Please try again later.")
+	}
+}
+
 func (b *TelegramBot) queueDownloadAlbum(chatID int64, albumID string) {
 	b.queueDownloadAlbumWithReply(chatID, albumID, 0)
 }
@@ -1130,6 +1234,10 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 }
 
 func (b *TelegramBot) enqueueDownload(chatID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func() error) {
+	_ = b.enqueueDownloadWithAfter(chatID, replyToID, single, format, transferMode, albumID, fn, nil)
+}
+
+func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func() error, after func()) bool {
 	if transferMode != transferModeOneByOne && transferMode != transferModeZip {
 		transferMode = transferModeOneByOne
 	}
@@ -1144,6 +1252,7 @@ func (b *TelegramBot) enqueueDownload(chatID int64, replyToID int, single bool, 
 		transferMode: transferMode,
 		albumID:      albumID,
 		fn:           fn,
+		after:        after,
 	}
 	b.queueMu.Lock()
 	inProgress := b.inProgress
@@ -1158,17 +1267,18 @@ func (b *TelegramBot) enqueueDownload(chatID int64, replyToID int, single bool, 
 
 	if queueFull {
 		_ = b.sendMessageWithReply(chatID, "Download queue is full. Please try again later.", nil, replyToID)
-		return
+		return false
 	}
 	select {
 	case b.downloadQueue <- req:
 	default:
 		_ = b.sendMessageWithReply(chatID, "Download queue is full. Please try again later.", nil, replyToID)
-		return
+		return false
 	}
 	if inProgress || queueLen > 0 {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued. Position: %d", position), nil, replyToID)
 	}
+	return true
 }
 
 func (b *TelegramBot) trySendCachedTrack(chatID int64, replyToID int, trackID string, format string) bool {
@@ -1178,6 +1288,21 @@ func (b *TelegramBot) trySendCachedTrack(chatID int64, replyToID int, trackID st
 	}
 	if err := b.sendAudioByFileID(chatID, entry, replyToID, trackID); err != nil {
 		b.deleteCachedAudio(trackID, entry.Format, entry.Compressed)
+		return false
+	}
+	return true
+}
+
+func (b *TelegramBot) tryEditInlineCachedTrack(inlineMessageID string, trackID string, format string) bool {
+	if inlineMessageID == "" {
+		return false
+	}
+	entry, ok := b.getCachedAudio(trackID, b.maxFileBytes, format)
+	if !ok {
+		return false
+	}
+	if err := b.editInlineMessageAudio(inlineMessageID, entry, trackID); err != nil {
+		fmt.Println("edit inline audio failed:", err)
 		return false
 	}
 	return true
@@ -2328,6 +2453,127 @@ func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyTo
 	return nil
 }
 
+func (b *TelegramBot) editInlineMessageAudio(inlineMessageID string, entry CachedAudio, trackID string) error {
+	if inlineMessageID == "" {
+		return nil
+	}
+	if entry.FileID == "" {
+		return fmt.Errorf("cached audio file_id is empty")
+	}
+	entry = b.enrichCachedAudio(trackID, entry)
+	sizeBytes := entry.SizeBytes
+	if sizeBytes <= 0 {
+		sizeBytes = entry.FileSize
+	}
+	format := normalizeTelegramFormat(entry.Format)
+	if format == "" {
+		format = telegramFormatFlac
+	}
+	media := InputMediaAudio{
+		Type:    "audio",
+		Media:   entry.FileID,
+		Caption: formatTelegramCaption(sizeBytes, entry.BitrateKbps, format),
+	}
+	if entry.Title != "" {
+		media.Title = entry.Title
+	}
+	if entry.Performer != "" {
+		media.Performer = entry.Performer
+	}
+	payload := map[string]any{
+		"inline_message_id": inlineMessageID,
+		"media":             media,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("editMessageMedia"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		apiResp := apiResponse{}
+		if err := json.Unmarshal(responseBody, &apiResp); err == nil && apiResp.Description != "" {
+			if strings.Contains(apiResp.Description, "message is not modified") {
+				return nil
+			}
+			return fmt.Errorf("telegram editMessageMedia error: %s", apiResp.Description)
+		}
+		return fmt.Errorf("telegram editMessageMedia failed: %s", strings.TrimSpace(string(responseBody)))
+	}
+	apiResp := apiResponse{}
+	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
+		return err
+	}
+	if !apiResp.OK {
+		if strings.Contains(apiResp.Description, "message is not modified") {
+			return nil
+		}
+		return fmt.Errorf("telegram editMessageMedia error: %s", apiResp.Description)
+	}
+	return nil
+}
+
+func (b *TelegramBot) editInlineMessageText(inlineMessageID string, text string) error {
+	if inlineMessageID == "" {
+		return nil
+	}
+	payload := map[string]any{
+		"inline_message_id": inlineMessageID,
+		"text":              text,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("editMessageText"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		apiResp := apiResponse{}
+		if err := json.Unmarshal(responseBody, &apiResp); err == nil && apiResp.Description != "" {
+			if strings.Contains(apiResp.Description, "message is not modified") {
+				return nil
+			}
+			return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+		}
+		return fmt.Errorf("telegram editMessageText failed: %s", strings.TrimSpace(string(responseBody)))
+	}
+	apiResp := apiResponse{}
+	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
+		return err
+	}
+	if !apiResp.OK {
+		if strings.Contains(apiResp.Description, "message is not modified") {
+			return nil
+		}
+		return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+	}
+	return nil
+}
+
 func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
 	if callbackID == "" {
 		return nil
@@ -2466,6 +2712,7 @@ func (b *TelegramBot) getUpdates(offset int) ([]Update, error) {
 	}
 	query := req.URL.Query()
 	query.Set("timeout", "30")
+	query.Set("allowed_updates", `["message","callback_query","inline_query","chosen_inline_result"]`)
 	if offset > 0 {
 		query.Set("offset", strconv.Itoa(offset))
 	}
@@ -2581,6 +2828,18 @@ func normalizeInlineSongSearchTerm(query string) string {
 	}
 }
 
+func inlineSearchResultID(kind string, itemID string, index int) string {
+	return fmt.Sprintf("%s:%s:%d", kind, itemID, index)
+}
+
+func songIDFromInlineResultID(resultID string) string {
+	parts := strings.Split(resultID, ":")
+	if len(parts) < 2 || parts[0] != "song" {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
 func inlineSearchTitle(item apputils.SearchResultItem) string {
 	title := strings.TrimSpace(item.Name)
 	switch strings.ToLower(item.ContentRating) {
@@ -2595,10 +2854,14 @@ func inlineSearchTitle(item apputils.SearchResultItem) string {
 func inlineSearchMessageText(kind string, item apputils.SearchResultItem) string {
 	switch kind {
 	case "song":
-		if item.ID == "" {
-			return ""
+		title := inlineSearchTitle(item)
+		if title == "" {
+			return strings.TrimSpace(item.Detail)
 		}
-		return "/songid " + item.ID
+		if item.Detail != "" {
+			return title + "\n" + item.Detail
+		}
+		return title
 	case "album":
 		if item.ID == "" {
 			return ""
@@ -2615,6 +2878,37 @@ func inlineSearchMessageText(kind string, item apputils.SearchResultItem) string
 		return text
 	default:
 		return ""
+	}
+}
+
+func inlinePendingMessageText(kind string, item apputils.SearchResultItem, fallback string) string {
+	if kind != "song" {
+		return fallback
+	}
+	text := strings.TrimSpace(fallback)
+	if text == "" {
+		text = strings.TrimSpace(item.Name)
+	}
+	if text == "" {
+		return "Preparing audio..."
+	}
+	return text + "\nPreparing audio..."
+}
+
+func inlineSearchReplyMarkup(item apputils.SearchResultItem) *InlineKeyboardMarkup {
+	url := strings.TrimSpace(item.URL)
+	if url == "" {
+		return nil
+	}
+	return &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{
+					Text: "Apple Music",
+					Url:  url,
+				},
+			},
+		},
 	}
 }
 

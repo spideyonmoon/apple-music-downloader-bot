@@ -101,8 +101,9 @@ Notes:
 1. Set `telegram-bot-token` in `config.yaml` (or export `TELEGRAM_BOT_TOKEN`).
 2. Optional: set `telegram-allowed-chat-ids` to restrict usage.
 3. Optional: set `telegram-api-url` to override the Telegram API base URL.
-4. Start the bot: `go run main.go --bot`
-5. Commands:
+4. Optional: set `telegram-cache-chat-id` to a private cache chat/channel so first inline uploads do not DM the user.
+5. Start the bot: `go run main.go --bot`
+6. Commands:
    - `/search_song <keywords>`
    - `/search_album <keywords>`
    - `/search_artist <keywords>`
@@ -115,6 +116,7 @@ Notes:
 - Large files are re-encoded to fit `telegram-max-file-mb` in FLAC mode (quality may be reduced).
 - For localized search results, set `telegram-search-language` (e.g. `zh-Hans`) or the global `language`.
 - To enable instant re-sends, set `telegram-cache-file` so the bot can reuse Telegram file IDs.
+- To avoid first inline downloads being sent privately, add the bot to a private cache chat/channel and set `telegram-cache-chat-id`.
 - Share buttons require enabling inline mode in BotFather.
 
 ## Downloading lyrics

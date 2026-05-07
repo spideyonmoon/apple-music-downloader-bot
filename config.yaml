@@ -64,6 +64,7 @@ convert-skip-lossy-to-lossless: true # If true, skip converting detected lossy s
 telegram-bot-token: ""            # Bot token or set TELEGRAM_BOT_TOKEN
 telegram-api-url: ""              # Optional API base URL override (default: https://api.telegram.org)
 telegram-allowed-chat-ids: []     # Optional chat ID allowlist
+telegram-cache-chat-id: 0         # Optional hidden chat/channel ID for first inline uploads
 telegram-search-limit: 8          # Results per search
 telegram-search-language: ""      # Optional search language override (e.g. zh-Hans, zh-Hant)
 telegram-max-file-mb: 50          # Max file size to send
