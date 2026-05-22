@@ -72,6 +72,7 @@ docker run --rm -it \
 注意：
 - 默认发送 ALAC，如需 FLAC 请使用 `/settings flac`（需要系统有 `ffmpeg`）。
 - 下载目录超过限制会自动清理旧文件（默认 3GB，可设置 `telegram-download-max-gb`，不影响 Telegram 缓存）。
+- Telegram API 请求（包括大文件上传）默认 3600 秒超时；需要更久可调高 `telegram-request-timeout-seconds`。
 - 超过限制的文件会在 FLAC 模式下重新压缩到 `telegram-max-file-mb`（音质可能下降）。
 - 如需中文搜索结果，可设置 `telegram-search-language`（例如 `zh-Hans`）或全局 `language`。
 - 如需“秒传”复用 Telegram 缓存，可设置 `telegram-cache-file` 保存 file_id 缓存。

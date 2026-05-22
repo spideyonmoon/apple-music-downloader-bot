@@ -29,6 +29,7 @@ const (
 	pendingTTL                   = 10 * time.Minute
 	defaultTelegramFormat        = "alac"
 	defaultTelegramDownloadMaxGB = 3
+	defaultTelegramTimeoutSecs   = 3600
 )
 
 const (
@@ -37,6 +38,8 @@ const (
 	transferModeOneByOne = "one"
 	transferModeZip      = "zip"
 )
+
+var telegramBotTokenPattern = regexp.MustCompile(`bot[0-9]+:[A-Za-z0-9_-]+`)
 
 type TelegramBot struct {
 	token        string
@@ -309,6 +312,29 @@ func telegramDownloadMaxBytes() int64 {
 	return int64(gb) * 1024 * 1024 * 1024
 }
 
+func telegramRequestTimeout() time.Duration {
+	seconds := Config.TelegramRequestTimeoutSeconds
+	if seconds <= 0 {
+		seconds = defaultTelegramTimeoutSecs
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (b *TelegramBot) sanitizeTelegramError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", b.sanitizeTelegramText(err.Error()))
+}
+
+func (b *TelegramBot) sanitizeTelegramText(text string) string {
+	text = telegramBotTokenPattern.ReplaceAllString(text, "bot<redacted>")
+	if b != nil && b.token != "" {
+		text = strings.ReplaceAll(text, b.token, "<redacted>")
+	}
+	return text
+}
+
 func newTelegramBot(token, appleToken string) *TelegramBot {
 	allowed := make(map[int64]bool)
 	for _, id := range Config.TelegramAllowedChatIDs {
@@ -335,7 +361,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		token:            token,
 		apiBase:          apiBase,
 		appleToken:       appleToken,
-		client:           &http.Client{Timeout: 60 * time.Second},
+		client:           &http.Client{Timeout: telegramRequestTimeout()},
 		allowedChats:     allowed,
 		cacheChatID:      Config.TelegramCacheChatID,
 		searchLimit:      searchLimit,
@@ -1732,7 +1758,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	req, err := http.NewRequest("POST", b.apiURL("sendAudio"), pr)
 	if err != nil {
 		_ = pw.CloseWithError(err)
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", contentType)
 	go func() {
@@ -1797,7 +1823,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		if writeErr != nil {
 			return writeErr
 		}
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	writeErr := <-writeErrCh
@@ -1812,7 +1838,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		return err
 	}
 	if !apiResp.OK {
-		return fmt.Errorf("telegram sendAudio error: %s", apiResp.Description)
+		return fmt.Errorf("telegram sendAudio error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	if hasMeta && meta.TrackID != "" && apiResp.Result.Audio.FileID != "" {
 		b.storeCachedAudio(meta.TrackID, CachedAudio{
@@ -1853,7 +1879,7 @@ func (b *TelegramBot) sendDocumentFile(chatID int64, filePath string, displayNam
 	req, err := http.NewRequest("POST", b.apiURL("sendDocument"), pr)
 	if err != nil {
 		_ = pw.CloseWithError(err)
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", contentType)
 	go func() {
@@ -1894,7 +1920,7 @@ func (b *TelegramBot) sendDocumentFile(chatID int64, filePath string, displayNam
 		if writeErr != nil {
 			return writeErr
 		}
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	writeErr := <-writeErrCh
@@ -1903,14 +1929,14 @@ func (b *TelegramBot) sendDocumentFile(chatID int64, filePath string, displayNam
 	}
 	if resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram sendDocument failed: %s", strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("telegram sendDocument failed: %s", b.sanitizeTelegramText(strings.TrimSpace(string(responseBody))))
 	}
 	apiResp := sendDocumentResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return err
 	}
 	if !apiResp.OK {
-		return fmt.Errorf("telegram sendDocument error: %s", apiResp.Description)
+		return fmt.Errorf("telegram sendDocument error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	if cacheKey != "" && apiResp.Result.Document.FileID != "" {
 		b.storeCachedDocument(cacheKey, CachedDocument{
@@ -1938,24 +1964,24 @@ func (b *TelegramBot) sendDocumentByFileID(chatID int64, entry CachedDocument, r
 	}
 	req, err := http.NewRequest("POST", b.apiURL("sendDocument"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram sendDocument failed: %s", strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("telegram sendDocument failed: %s", b.sanitizeTelegramText(strings.TrimSpace(string(responseBody))))
 	}
 	apiResp := apiResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return err
 	}
 	if !apiResp.OK {
-		return fmt.Errorf("telegram sendDocument error: %s", apiResp.Description)
+		return fmt.Errorf("telegram sendDocument error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return nil
 }
@@ -2378,12 +2404,12 @@ func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, mark
 	}
 	req, err := http.NewRequest("POST", b.apiURL("sendMessage"), bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -2394,7 +2420,7 @@ func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, mark
 		return 0, err
 	}
 	if !apiResp.OK {
-		return 0, fmt.Errorf("telegram sendMessage error: %s", apiResp.Description)
+		return 0, fmt.Errorf("telegram sendMessage error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return apiResp.Result.MessageID, nil
 }
@@ -2431,24 +2457,24 @@ func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyTo
 	}
 	req, err := http.NewRequest("POST", b.apiURL("sendAudio"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram sendAudio failed: %s", strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("telegram sendAudio failed: %s", b.sanitizeTelegramText(strings.TrimSpace(string(responseBody))))
 	}
 	apiResp := sendAudioResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return err
 	}
 	if !apiResp.OK {
-		return fmt.Errorf("telegram sendAudio error: %s", apiResp.Description)
+		return fmt.Errorf("telegram sendAudio error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return nil
 }
@@ -2490,12 +2516,12 @@ func (b *TelegramBot) editInlineMessageAudio(inlineMessageID string, entry Cache
 	}
 	req, err := http.NewRequest("POST", b.apiURL("editMessageMedia"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
@@ -2508,9 +2534,9 @@ func (b *TelegramBot) editInlineMessageAudio(inlineMessageID string, entry Cache
 			if strings.Contains(apiResp.Description, "message is not modified") {
 				return nil
 			}
-			return fmt.Errorf("telegram editMessageMedia error: %s", apiResp.Description)
+			return fmt.Errorf("telegram editMessageMedia error: %s", b.sanitizeTelegramText(apiResp.Description))
 		}
-		return fmt.Errorf("telegram editMessageMedia failed: %s", strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("telegram editMessageMedia failed: %s", b.sanitizeTelegramText(strings.TrimSpace(string(responseBody))))
 	}
 	apiResp := apiResponse{}
 	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
@@ -2520,7 +2546,7 @@ func (b *TelegramBot) editInlineMessageAudio(inlineMessageID string, entry Cache
 		if strings.Contains(apiResp.Description, "message is not modified") {
 			return nil
 		}
-		return fmt.Errorf("telegram editMessageMedia error: %s", apiResp.Description)
+		return fmt.Errorf("telegram editMessageMedia error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return nil
 }
@@ -2539,12 +2565,12 @@ func (b *TelegramBot) editInlineMessageText(inlineMessageID string, text string)
 	}
 	req, err := http.NewRequest("POST", b.apiURL("editMessageText"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
@@ -2557,9 +2583,9 @@ func (b *TelegramBot) editInlineMessageText(inlineMessageID string, text string)
 			if strings.Contains(apiResp.Description, "message is not modified") {
 				return nil
 			}
-			return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+			return fmt.Errorf("telegram editMessageText error: %s", b.sanitizeTelegramText(apiResp.Description))
 		}
-		return fmt.Errorf("telegram editMessageText failed: %s", strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("telegram editMessageText failed: %s", b.sanitizeTelegramText(strings.TrimSpace(string(responseBody))))
 	}
 	apiResp := apiResponse{}
 	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
@@ -2569,7 +2595,7 @@ func (b *TelegramBot) editInlineMessageText(inlineMessageID string, text string)
 		if strings.Contains(apiResp.Description, "message is not modified") {
 			return nil
 		}
-		return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+		return fmt.Errorf("telegram editMessageText error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return nil
 }
@@ -2587,12 +2613,12 @@ func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
 	}
 	req, err := http.NewRequest("POST", b.apiURL("answerCallbackQuery"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	return nil
@@ -2614,12 +2640,12 @@ func (b *TelegramBot) answerInlineQuery(inlineQueryID string, results any, perso
 	}
 	req, err := http.NewRequest("POST", b.apiURL("answerInlineQuery"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	return nil
@@ -2643,12 +2669,12 @@ func (b *TelegramBot) editMessageText(chatID int64, messageID int, text string, 
 	}
 	req, err := http.NewRequest("POST", b.apiURL("editMessageText"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
@@ -2662,10 +2688,10 @@ func (b *TelegramBot) editMessageText(chatID int64, messageID int, text string, 
 				return nil
 			}
 			if apiResp.Description != "" {
-				return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+				return fmt.Errorf("telegram editMessageText error: %s", b.sanitizeTelegramText(apiResp.Description))
 			}
 		}
-		return fmt.Errorf("telegram editMessageText failed: %s", strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("telegram editMessageText failed: %s", b.sanitizeTelegramText(strings.TrimSpace(string(responseBody))))
 	}
 	apiResp := apiResponse{}
 	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
@@ -2675,7 +2701,7 @@ func (b *TelegramBot) editMessageText(chatID int64, messageID int, text string, 
 		if strings.Contains(apiResp.Description, "message is not modified") {
 			return nil
 		}
-		return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+		return fmt.Errorf("telegram editMessageText error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return nil
 }
@@ -2694,12 +2720,12 @@ func (b *TelegramBot) deleteMessage(chatID int64, messageID int) error {
 	}
 	req, err := http.NewRequest("POST", b.apiURL("deleteMessage"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	return nil
@@ -2708,7 +2734,7 @@ func (b *TelegramBot) deleteMessage(chatID int64, messageID int) error {
 func (b *TelegramBot) getUpdates(offset int) ([]Update, error) {
 	req, err := http.NewRequest("GET", b.apiURL("getUpdates"), nil)
 	if err != nil {
-		return nil, err
+		return nil, b.sanitizeTelegramError(err)
 	}
 	query := req.URL.Query()
 	query.Set("timeout", "30")
@@ -2719,7 +2745,7 @@ func (b *TelegramBot) getUpdates(offset int) ([]Update, error) {
 	req.URL.RawQuery = query.Encode()
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, b.sanitizeTelegramError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -2730,7 +2756,7 @@ func (b *TelegramBot) getUpdates(offset int) ([]Update, error) {
 		return nil, err
 	}
 	if !data.OK {
-		return nil, fmt.Errorf("getUpdates error: %s", data.Description)
+		return nil, fmt.Errorf("getUpdates error: %s", b.sanitizeTelegramText(data.Description))
 	}
 	return data.Result, nil
 }
