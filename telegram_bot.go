@@ -791,9 +791,12 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 	if msg.Text == "" {
 		return
 	}
-	if !b.isAllowedChat(msg.Chat.ID) {
-		_ = b.sendMessage(msg.Chat.ID, "Not authorized for this bot.", nil)
+	if msg.Chat.Type == "private" {
+		_ = b.sendMessage(msg.Chat.ID, "This bot only operates in specific groups.", nil)
 		return
+	}
+	if !b.isAllowedChat(msg.Chat.ID) {
+		return // Silently ignore non-allowed groups to avoid spamming
 	}
 	text := strings.TrimSpace(msg.Text)
 	if cmd, args, ok := parseCommand(text); ok {
@@ -918,70 +921,33 @@ func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
 func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, replyToID int) {
 	switch cmd {
 	case "start", "help":
-		_ = b.sendMessage(chatID, botHelpText(), nil)
-	case "search_song":
-		b.handleSearch(chatID, "song", strings.Join(args, " "), replyToID)
-	case "search_album", "serach_album":
-		b.handleSearch(chatID, "album", strings.Join(args, " "), replyToID)
-	case "search_artist", "serach_artist":
-		b.handleSearch(chatID, "artist", strings.Join(args, " "), replyToID)
-	case "serach_song":
-		b.handleSearch(chatID, "song", strings.Join(args, " "), replyToID)
-	case "search":
-		if len(args) < 2 {
-			_ = b.sendMessageWithReply(chatID, "Usage: /search <song|album|artist> <keywords>", nil, replyToID)
-			return
-		}
-		kind := strings.ToLower(args[0])
-		b.handleSearch(chatID, kind, strings.Join(args[1:], " "), replyToID)
-	case "id":
+		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.", nil)
+	case "dl":
 		if len(args) == 0 {
-			_ = b.sendMessage(chatID, "Usage: /id <song|album> <id>", nil)
+			_ = b.sendMessageWithReply(chatID, "Usage: /dl <apple-music-link>", nil, replyToID)
 			return
 		}
-		if len(args) == 1 {
-			b.queueDownloadSong(chatID, args[0])
+		link := args[0]
+		
+		_, songID := checkUrlSong(link)
+		if songID != "" {
+			b.queueDownloadSongWithReply(chatID, songID, replyToID)
 			return
 		}
-		switch strings.ToLower(args[0]) {
-		case "song":
-			b.queueDownloadSong(chatID, args[1])
-		case "album":
-			b.queueDownloadAlbum(chatID, args[1])
-		default:
-			_ = b.sendMessage(chatID, "Usage: /id <song|album> <id>", nil)
-		}
-	case "songid":
-		if len(args) == 0 {
-			_ = b.sendMessage(chatID, "Usage: /songid <id>", nil)
+		
+		_, albumID := checkUrl(link)
+		if albumID != "" {
+			b.queueDownloadAlbumWithReply(chatID, albumID, replyToID)
 			return
 		}
-		b.queueDownloadSong(chatID, args[0])
-	case "albumid":
-		if len(args) == 0 {
-			_ = b.sendMessage(chatID, "Usage: /albumid <id>", nil)
+		
+		_, artistID := checkUrlArtist(link)
+		if artistID != "" {
+			_ = b.sendMessageWithReply(chatID, "Downloading artist discographies is not allowed.", nil, replyToID)
 			return
 		}
-		b.queueDownloadAlbum(chatID, args[0])
-	case "artistid":
-		if len(args) == 0 {
-			_ = b.sendMessage(chatID, "Usage: /artistid <id> [name]", nil)
-			return
-		}
-		b.showArtistAlbums(chatID, args[0], strings.Join(args[1:], " "), replyToID)
-	case "settings":
-		if len(args) > 0 {
-			normalized := normalizeTelegramFormat(args[0])
-			if normalized == "" {
-				_ = b.sendMessageWithReply(chatID, "Usage: /settings <alac|flac>", nil, replyToID)
-				return
-			}
-			b.setChatFormat(chatID, normalized)
-			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Download format set to %s.", strings.ToUpper(normalized)), buildSettingsKeyboard(normalized), replyToID)
-			return
-		}
-		current := b.getChatFormat(chatID)
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Download format: %s", strings.ToUpper(current)), buildSettingsKeyboard(current), replyToID)
+		
+		_ = b.sendMessageWithReply(chatID, "Invalid Apple Music link.", nil, replyToID)
 	default:
 		_ = b.sendMessage(chatID, "Unknown command. Send /help for usage.", nil)
 	}
@@ -2189,7 +2155,7 @@ func formatTelegramCaption(sizeBytes int64, bitrateKbps float64, format string) 
 	if tag == "" {
 		tag = telegramFormatFlac
 	}
-	return fmt.Sprintf("#AppleMusic #%s 文件大小%.2fMB %.2fkbps\nvia @ultimateapplemusicdownloaderbot", tag, sizeMB, bitrateKbps)
+	return fmt.Sprintf("#AppleMusic #%s\nSize: %.2f MB | %.2f kbps", tag, sizeMB, bitrateKbps)
 }
 
 func findCoverFile(dir string) string {
@@ -2767,7 +2733,7 @@ func (b *TelegramBot) apiURL(method string) string {
 
 func (b *TelegramBot) isAllowedChat(chatID int64) bool {
 	if len(b.allowedChats) == 0 {
-		return true
+		return false
 	}
 	return b.allowedChats[chatID]
 }
